@@ -1,278 +1,156 @@
-# CREST: Cognitive REasoning Steering at Test‑time
+# CoT Compression
 
-## TL; DR
-CREST is a training-free test-time steering framework that discovers cognitive heads via simple offline calibration and then rotates activations during decoding to guide the model’s reasoning—preserving norms to avoid per-model hyperparameter tuning. This improves accuracy and reduces tokens across models and datasets.
+Internal-trajectory analysis of Llama-3.1-8B-Instruct chains of thought on
+GSM8K, and a DBSCAN-based method for compressing a chain by dropping
+internally redundant reasoning steps.
 
-## What is CREST?
+This repo contains only the pipeline **code**. None of the generated data,
+model caches, or intermediate artifacts are included (they're large --
+multiple GB -- and easily regenerated). This README walks through producing
+everything needed, in order, ending with the DBSCAN compression scripts.
 
-CREST (**C**ognitive **RE**asoning **S**teering at **T**est-time) identifies attention heads whose activations are predictive of different reasoning modes (“cognitive heads”), then steers those heads at inference to suppress inefficient trajectories and encourage effective reasoning—without further training.
-
-* Token savings with accuracy gains. e.g., R1-7B on MATH500: 92.4% with 34% fewer tokens; R1-1.5B on AMC23: 37.6% token reduction at higher accuracy. 
-* Generalizes across models/datasets (DeepSeek-R1 1.5B/7B/32B, Qwen3-4B/30B, GPT-OSS-20B; MATH500, AIME, AMC23, GPQA-D, LiveCodeBench, Calendar Planning). 
-* Head ratio “gold default.” Steering about the top ~38% heads (ranked by linear-probe accuracy) balances accuracy and token reduction; adopted as the default.
-
-## Usage
-
-### Install
-
-Recommend use vllm docker:
-```vllm/vllm-openai@sha256:d731ee65c044ae0977421eed3d93f931d4b7d79614394184c939db35b8f28fc2``` & ```docker_info.txt```
-
-inside the docker:
-```
-cd CREST/probing/omni_math_rule/evaluation
-pip install evaluate
-cd latex2sympy
-pip install -e .
-cd ..
-pip install -r requirements.txt 
-cd ../../
-pip install lighteval
-pip install datasets==3.5.0
-pip install emoji
-```
-
-otherwise:
-```bash
-cd CREST
-pip install requirements.txt
-cd probing/omni_math_rule/evaluation
-pip install evaluate
-cd latex2sympy
-pip install -e .
-cd ..
-pip install -r requirements.txt 
-cd ../../
-pip install lighteval
-pip install datasets==3.5.0
-pip install emoji
-```
-
-### Running Baseline Experiments
+## Requirements
 
 ```bash
-# Run baseline without steering
-bash script/baseline.sh
+pip install torch transformers accelerate numpy scikit-learn matplotlib --break-system-packages
 ```
 
-This script:
-- Sets `STEERING=False`
-- Evaluates models across multiple datasets
-- Saves results in `results/SteeringFalse/` directory
+- **GPU** with enough VRAM for Llama-3.1-8B-Instruct in bf16 (~16GB minimum).
+- **Hugging Face access** to `meta-llama/Llama-3.1-8B-Instruct` (accept the
+  license on the model's HF page, then set `HF_TOKEN` in your environment):
+  ```bash
+  export HF_TOKEN=hf_your_token_here
+  ```
+- **A Phase-0-filtered problem set** (see below) -- NOT included in this repo.
 
-### Running Steering Experiments
+## Prerequisite data: the Phase 0 filtered problem set
+
+Every script downstream assumes you already have a `.jsonl` file of GSM8K
+problems that the model gets **wrong without chain-of-thought but right
+with it**. This filter matters: it ensures every result is evidence about
+reasoning, not about the model already knowing the answer.
+
+Each line needs at minimum:
+```json
+{"question": "...", "gold_answer": "18", "no_cot_correct": false, "cot_correct": true}
+```
+
+If you don't already have this file, produce it by: for each GSM8K problem,
+sample a no-CoT completion and a CoT completion from the target model, check
+correctness of each against the gold answer, and keep only rows where
+`no_cot_correct=false` and `cot_correct=true`.
+
+Update `PROBLEMS_PATH` at the top of `capture_chains.py` to point at your file.
+
+## Pipeline: run in this order
+
+### 1. Extract the embedding matrix (one-time, ~1GB output)
+```bash
+python3 extract_embeddings.py
+```
+Produces `embed_matrix.npy`. Needed for the anisotropy correction used
+throughout (projects out each token's own embedding direction from its
+residual state).
+
+### 2. Sample chains of thought (GPU, the expensive step)
+```bash
+python3 capture_chains.py
+```
+Edit `MAX_PROBLEMS` and `N_CHAINS_PER_PROBLEM` at the top first (defaults are
+conservative -- start small to sanity check before scaling up). Produces
+`chain_captures/<problem_id>.pt` -- for every sampled chain, every token's
+residual stream at a middle layer (`LAYER=16` by default) plus a running
+answer-probability trace (logit-lens).
+
+### 3. Chunk chains into reasoning steps (CPU, fast)
+```bash
+python3 chunk_chains.py
+```
+Reads `chain_captures/`, splits each chain into semantic chunks (roughly one
+reasoning step each), produces `chunked_captures/<problem_id>.pt`.
+
+### 4. DTW alignment + anisotropy correction (CPU, fast)
+```bash
+python3 dtw_align_v2.py
+```
+Reads `chunked_captures/` and `embed_matrix.npy`. Fits the anisotropy
+correction (mean-centering, token-direction projection, per-dimension
+standardization) on the full dataset and computes DTW distances between
+every pair of sampled chains. Produces `anisotropy_correction.npz` (needed
+by every later script) and `phase3_pairwise.pkl`.
+
+### 5. Build consensus routes (CPU, fast)
+```bash
+python3 build_consensus_routes.py
+```
+Picks, per problem, the "medoid" correct chain -- the one with lowest
+average DTW distance to every other correct chain for that problem.
+Produces `consensus_routes.pkl`.
+
+### 6. Layer sweep -- extract all-layer residuals (GPU, moderate cost)
+```bash
+python3 layer_sweep.py
+```
+For every chain, re-runs it through the model as a single teacher-forced
+forward pass (no sampling) capturing residuals at **every** layer at once.
+Produces `layer_sweep_residuals.pkl` -- **this is what the DBSCAN
+compression scripts actually read from**, since it has both layer 16 and
+the final layer cached without needing another forward pass. Also prints a
+layer-by-layer comparison of which layer best separates correct from
+incorrect reasoning (empirically, layer 16 wins on this dataset).
+
+## The DBSCAN compression approach
+
+With the above artifacts in place, three scripts explore compressing a
+chain by dropping internally redundant steps (steps whose residual states
+cluster together within a single chain):
 
 ```bash
-# Run with steering enabled
-bash script/ours.sh
+python3 dbscan_compress.py           # exploratory: cluster + compress a
+                                      # handful of problems' medoid chains,
+                                      # print the resulting text
+python3 verify_compressed_chains.py  # rigorous check: strip the answer
+                                      # line from compressed chains, force
+                                      # the model to re-derive it, measure
+                                      # real accuracy + token reduction
+python3 eps_scaling_law.py           # sweep DBSCAN's eps parameter finely,
+                                      # trace accuracy and token-reduction
+                                      # as curves -> eps_scaling_law.csv/.png
 ```
 
-This script:
-- Sets `STEERING=True`
-- Configures steering parameters:
-  - `steering_number=512`: Number of top steering vectors to use
-  - `steering_coef=-4`: Steering coefficient (negative for inhibition)
-  - `steering_mode=after_o_proj_norm_threshold`: Steering application mode
-- Saves results in `results/SteeringTrue_numb512_coef-4_mode[mode]/` directory
-- **NOW STEERING MUST SET ```--enforce_eager```, CUDA GRAPH AND TORCH COMPILE ARE NOT SUPPORTED YET**
+Key parameters to know about (top of each file):
+- `EPS_VALUES` / `EPS_GRID` -- DBSCAN's neighborhood radius (cosine
+  distance). Larger eps = more aggressive compression. Empirically on this
+  dataset, ~0.35-0.45 preserves accuracy well; ~0.65+ starts dropping
+  load-bearing computation, not just redundant narration.
+- `LAYERS_TO_TRY` (in `dbscan_compress.py`) -- layer 16 (best for
+  correct/incorrect separation) shows almost no *within-chain* redundancy
+  to exploit; the final layer picks up more surface-level/stylistic
+  redundancy and is what the compression scripts default to.
+- `N_PROBLEMS` -- how many problems to run on. Start small, scale up once
+  you trust the pipeline (all of the above scripts checkpoint or cache
+  where possible).
 
-#### Steering Vector Zoo
-The Steering Vector Zoo contains pre-trained steering vectors that can be applied to modify model behavior during inference. These vectors are learned through probing techniques and stored as PyTorch (.pt) files.
+## Other scripts in this repo
 
-```
-probing/results/
-├── [DATASET]/ # Training dataset (e.g., MATH_train)
-│ └── [MODEL]/ # Model name (e.g., Qwen3-30B-A3B-Thinking-2507)
-│ └── template-t0-n1-[SIZE]/ # Template and size configuration
-│  └── hidden[MODE]/ # Steering mode directory
-|   └── mix_others_low_rank_1000/ # Training methods
-│    └── probe_best.pt # Steering vector file
-```
-The system automatically selects the top-k most accurate steering vectors based on:
-1. **Probe Accuracy**: Classification performance on the validation set
-2. **Layer-Head Coverage**: Distribution across different attention layers and heads
-3. **Steering Coefficient**: Magnitude of influence (configurable via `--steering_coef`)
+- `guided_generate.py` -- Phase 5: best-of-K search generating a new short
+  chain, scored by answer-probability, route-proximity, or both, against
+  the consensus route from step 5 above.
+- `dtw_align_velocity.py` -- same DTW comparison as step 4, but on
+  step-to-step *changes* in residual state rather than the states
+  themselves.
+- `validate_latent_rewards.py` -- checks whether DTW distance to a
+  problem's consensus route correlates with chain correctness (a cheap
+  offline validation before investing in RL-based training).
+- `cluster_stats.py` -- clustered bootstrap confidence intervals and a
+  within-problem permutation test on the DTW distances from step 4.
+- `compare_methods.py` -- aggregates accuracy-vs-tokens across whichever
+  methods you've run, into one comparison table/chart.
 
-#### Manual Execution
+## A note on scale
 
-```bash
-python main_vllm.py \
-    --model_name_or_path "Qwen/Qwen3-30B-A3B-Thinking-2507" \
-    --dataset "aime25" \
-    --save_dir "results/test/" \
-    --use_chat_format \
-    --temperature 0.6 \
-    --max_tokens 32768 \
-    --steering True \
-    --steering_vector_path "/path/to/steering/vectors/" \
-    --steering_number 512 \
-    --steering_coef -4 \
-    --steering_mode "after_o_proj_norm_threshold"
-```
-
-#### Required Environment Variables (for steering)
-
-```bash
-export STEERING=True
-export STEERING_VECTOR_PATH="/path/to/steering/vectors/"
-export STEERING_NUMBER=512
-export STEERING_COEF=-4
-export STEERING_MODE="after_o_proj_norm_threshold"
-export MODEL_NAME_OR_PATH="Qwen/Qwen3-30B-A3B-Thinking-2507"
-```
-
-## Repository overview
-
-The implementation consists of three main components:
-
-### 1. Main Inference Engine (`main_vllm.py`)
-- **Purpose**: Core inference script supporting multiple datasets and models
-- **Features**:
-  - Support for multiple datasets (MATH, GSM, AIME, GPQA, LiveCodeBench, etc.)
-  - Batch processing with vLLM backend
-  - Configurable steering parameters
-  - Multi-model support with automatic model detection
-
-### 2. Steering Implementation (`probing/modeling_utils/vllm/`)
-Contains model-specific monkey patches for different architectures:
-
-- **`qwen2/monkey_patch.py`**: DeepSeek-R1-Distill-Qwen models
-- **`qwen3/monkey_patch.py`**: Qwen3-4B-Thinking models  
-- **`qwen3_moe/monkey_patch.py`**: Qwen3-30B-A3B-Thinking models
-- **`gpt_oss/monkey_patch.py`**: GPT-OSS models
-
-Each monkey patch implements:
-- Attention mechanism modifications
-- Layer-wise steering vector application
-- Dynamic steering flag management
-- Multiple steering modes
-
-### 3. Evaluation System (`probing/get_omni_results.py`)
-- **Purpose**: Mathematical reasoning evaluation using OmniMath rules
-- **Features**:
-  - Parallel evaluation with timeout handling
-  - Multiple prediction aggregation
-  - Accuracy computation and result saving
-
-## Steering Modes
-
-The system supports four distinct steering modes, each applying steering vectors at different points in the attention mechanism:
-
-### 1. `before_o_proj`
-- **Application Point**: Before the output projection in attention
-- **Mechanism**: Modifies attention output before linear transformation
-- **Use Case**: Early intervention in attention computation
-
-### 2. `after_o_proj` 
-- **Application Point**: After the output projection in attention
-- **Mechanism**: Direct modification of projected attention output
-- **Use Case**: Standard steering application
-
-### 3. `after_o_proj_norm`
-- **Application Point**: After output projection with norm preservation
-- **Mechanism**: Applies steering while preserving vector norms
-- **Use Case**: Maintaining activation magnitude consistency
-
-### 4. `after_o_proj_norm_threshold`
-- **Application Point**: After output projection with thresholded norm preservation
-- **Mechanism**: Applies steering with awareness thresholding and norm preservation
-- **Use Case**: Selective steering based on activation patterns
-
-## Supported Datasets
-
-- **"aime25"**
-- **"AIME"**
-- **"amc23"**
-- **"cp"**
-- **"lcb"**
-- **"MATH500"**
-- **"GSM"**
-- **"gpqa"**
-
-## Supported Models
-
-The system automatically detects and applies appropriate steering based on model names:
-
-- **DeepSeek-R1-Distill-Qwen**: Uses `qwen2` monkey patch
-- **Qwen3-4B**: Uses `qwen3` monkey patch  
-- **Qwen3-30B**: Uses `qwen3_moe` monkey patch
-- **gpt-oss**: Uses `gpt_oss` monkey patch
-
-
-## Steering Vector Format
-
-Steering vectors should be saved as PyTorch files with the following structure:
-
-```python
-{
-    layer_idx: {
-        head_idx: {
-            'accuracy': float,           # Probe accuracy
-            'model_dict': {
-                'weight': torch.Tensor   # Hyperplane weights
-            },
-            'steering_vector': torch.Tensor  # Steering direction
-        }
-    }
-}
-```
-
-## Output Structure
-
-Results are saved in the following structure:
-```
-results/
-├── SteeringFalse/                    # Baseline results
-│   └── [model]/[dataset]/seed[X]/
-├── SteeringTrue_numb[N]_coef[C]_mode[M]/  # Steering results
-│   └── [model]/[dataset]/
-└── predictions.jsonl                 # Detailed predictions
-└── metrics.json                      # Evaluation metrics
-```
-
-## Key Features
-
-- **Dynamic Steering**: Steering is applied based on token patterns (e.g., double newlines)
-- **Multi-GPU Support**: Tensor parallelism with proper rank handling
-- **Batch Processing**: Efficient batch inference with vLLM
-- **Comprehensive Evaluation**: Multiple evaluation metrics per dataset
-- **Flexible Configuration**: Easy parameter tuning through environment variables
-
-## Technical Implementation
-
-### Steering Mechanism
-
-1. **Vector Loading**: Top-k steering vectors are loaded based on probe accuracy
-2. **Flag Detection**: Steering flags are set based on specific token patterns
-3. **Awareness Computation**: Hyperplane-based awareness scores determine steering strength
-4. **Vector Application**: Steering vectors are applied with configurable coefficients
-5. **Norm Preservation**: Optional norm preservation maintains activation magnitudes
-
-### Model Patching
-
-The system uses runtime monkey patching to modify:
-- `forward()` methods in attention layers
-- `forward()` methods in decoder layers  
-- `forward()` methods in the main model
-- Token-based steering flag management
-
-## Performance Considerations
-
-- **Memory**: Steering vectors are loaded onto GPU memory
-- **Scalability**: Supports tensor parallelism for large models
-- **Efficiency**: Conditional application reduces unnecessary computation
-
-## Research Applications
-
-This implementation supports research in:
-- Mechanistic interpretability of reasoning
-- Activation steering and control
-- Cognitive enhancement in language models
-- Mathematical reasoning improvement
-- Code generation optimization
-
-## Citation
-
-If you use this code or ideas, please cite the CREST paper:
-
-*Understanding and Steering The Cognitive Behaviors of Reasoning Models At Test-Time (CREST)*
+Everything above was developed and validated on 10-100 filtered GSM8K
+problems. Intermediate files get large fast -- `chain_captures/` alone was
+~5-6GB at 100 problems -- so if you're on a shared/quota-limited machine,
+consider pointing the working directory at scratch storage rather than a
+home directory from the start.
