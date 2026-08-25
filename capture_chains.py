@@ -40,8 +40,9 @@ TOP_P = 0.95
 
 PROBLEMS_PATH = "ProxySPECS/data/gsm8k_cot_necessary.jsonl"   # your Phase 0 output (jsonl)
 OUT_DIR = "chain_captures"
-MAX_PROBLEMS = 100           # cap for a quick pipeline sanity check; set to
-                            # None to run the full filtered set
+MAX_PROBLEMS = 501          # target problem count; already-captured problems
+                             # are skipped automatically, so bumping this up
+                             # only processes the NEW ones
 
 os.makedirs(OUT_DIR, exist_ok=True)
 
@@ -247,6 +248,15 @@ def main():
         pid = problem["id"]
         question = problem["question"]
         gold_answer = str(problem["answer"]).strip()
+
+        # Skip problems already captured in a previous run -- avoids
+        # re-spending GPU time regenerating chains we already have when
+        # MAX_PROBLEMS is bumped up to extend the dataset.
+        out_path = os.path.join(OUT_DIR, f"{pid}.pt")
+        if os.path.exists(out_path):
+            print(f"[skip] problem {pid}: already captured -> {out_path}")
+            continue
+
         ans_tok_id = answer_token_id(gold_answer)
 
         if ans_tok_id is None:

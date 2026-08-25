@@ -182,6 +182,15 @@ def main():
     print(f"Found {len(in_paths)} problem files in {IN_DIR}")
 
     for path in in_paths:
+        # Skip if already chunked -- pid is derivable straight from the
+        # filename (chain_captures/<pid>.pt), so we can skip WITHOUT even
+        # loading the input file for problems already done.
+        pid_from_filename = os.path.splitext(os.path.basename(path))[0]
+        out_path = os.path.join(OUT_DIR, f"{pid_from_filename}.pt")
+        if os.path.exists(out_path):
+            print(f"[skip] problem {pid_from_filename}: already chunked -> {out_path}")
+            continue
+
         data = torch.load(path, weights_only=False)
         pid = data["problem_id"]
 
@@ -193,7 +202,6 @@ def main():
             chunk_count_stats.append(len(chunked["chunks"]))
 
         data["chains"] = new_chains
-        out_path = os.path.join(OUT_DIR, f"{pid}.pt")
         torch.save(data, out_path)
 
         avg_chunks = sum(chunk_count_stats) / len(chunk_count_stats) if chunk_count_stats else 0

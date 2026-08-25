@@ -32,6 +32,7 @@ Output: layer_sweep_residuals.pkl (all-layer residuals per chunk, so you
         layer_sweep_results.csv (the comparison table)
 """
 
+import os
 import glob
 import pickle
 import random
@@ -83,15 +84,16 @@ def build_prompt(tokenizer, question: str) -> str:
 # Step 1: extract all-layer residuals via one forward pass per chain
 # ---------------------------------------------------------------------------
 @torch.no_grad()
-def extract_all_layers(model, tokenizer):
+def extract_all_layers(model, tokenizer, paths, records):
     """
-    Returns a flat list of records:
-      {problem_id, chain_idx, correct, chunk_residuals}
-    where chunk_residuals is (n_chunks, n_hidden_layers, hidden_dim) --
-    every chunk's last-token residual, at every layer.
+    Extends `records` in place by extracting all-layer residuals for every
+    chain in the given `paths` list (NOT a glob -- caller controls exactly
+    which problems get processed, so already-cached problems can be
+    skipped). Checkpoints the CUMULATIVE records list after each problem,
+    so a crash only loses the current problem's chains, not the whole run
+    (including anything already in the cache from a previous session).
     """
-    records = []
-    for path in sorted(glob.glob(f"{CHUNKED_DIR}/*.pt")):
+    for path in paths:
         data = torch.load(path, weights_only=False)
         pid = data["problem_id"]
         question = data["question"]
@@ -107,8 +109,6 @@ def extract_all_layers(model, tokenizer):
             prompt_len = prompt_ids.shape[1]
 
             outputs = model(input_ids=full_ids, output_hidden_states=True)
-            # outputs.hidden_states: tuple of (1, seq_len, hidden), one per
-            # layer (including the embedding layer at index 0).
             n_layers = len(outputs.hidden_states)
 
             chunk_residuals = []
@@ -117,9 +117,9 @@ def extract_all_layers(model, tokenizer):
                 per_layer = torch.stack([
                     outputs.hidden_states[l][0, abs_pos, :].float().cpu()
                     for l in range(n_layers)
-                ])  # (n_layers, hidden)
+                ])
                 chunk_residuals.append(per_layer)
-            chunk_residuals = torch.stack(chunk_residuals)  # (n_chunks, n_layers, hidden)
+            chunk_residuals = torch.stack(chunk_residuals)
 
             records.append({
                 "problem_id": pid,
@@ -129,12 +129,27 @@ def extract_all_layers(model, tokenizer):
                 "chunk_residuals": chunk_residuals.numpy().astype(np.float32),
             })
 
-        # Progress + incremental checkpoint after each PROBLEM (not each
-        # chain) -- cheap enough to do often, and means a crash partway
-        # through only loses the current problem's chains, not everything.
-        print(f"  [{pid}] done ({len(records)} chains extracted so far)")
-        with open(RESIDUALS_CACHE, "wb") as f:
+        print(f"  [{pid}] done ({len(records)} total chains cached so far)")
+        # Atomic write: save to a temp file first, then rename over the
+        # real path. Writing directly to RESIDUALS_CACHE would truncate the
+        # existing good file immediately on open, BEFORE the new data is
+        # fully written -- if the process is interrupted mid-write, that
+        # destroys the previously-good checkpoint instead of just losing
+        # the current problem's chains.
+        #
+        # IMPORTANT: if RESIDUALS_CACHE is a symlink (e.g. pointing to
+        # scratch storage to avoid a home-directory quota), we resolve to
+        # the REAL target path for both the tmp file and the final
+        # replace. Otherwise the tmp file would be created as a fresh file
+        # in the current directory (ignoring the symlink), and os.replace
+        # would overwrite the symlink itself with a real file -- silently
+        # undoing the scratch-storage redirection and landing back in the
+        # quota-limited home directory.
+        real_target = os.path.realpath(RESIDUALS_CACHE) if os.path.exists(RESIDUALS_CACHE) else RESIDUALS_CACHE
+        tmp_path = real_target + ".tmp"
+        with open(tmp_path, "wb") as f:
             pickle.dump(records, f)
+        os.replace(tmp_path, real_target)
     return records
 
 
@@ -292,26 +307,43 @@ def analyze_layer(layer_idx, records, embed_matrix):
 def main():
     embed_matrix = np.load(EMBED_MATRIX_PATH)
 
+    # Load whatever's already cached (may be from a smaller-scale earlier
+    # run) rather than assuming it's either complete or absent -- we EXTEND
+    # it with only the problems not yet present.
     try:
         with open(RESIDUALS_CACHE, "rb") as f:
             records = pickle.load(f)
-        print(f"Loaded cached all-layer residuals from {RESIDUALS_CACHE} "
-              f"({len(records)} chains). NOTE: this cache is now written "
-              f"incrementally (after each problem) -- if a previous run was "
-              f"interrupted, this may be a PARTIAL set. Delete "
-              f"{RESIDUALS_CACHE} first if you want a full clean re-extraction.")
+        print(f"Loaded {len(records)} cached chains from {RESIDUALS_CACHE}")
     except FileNotFoundError:
-        print("Loading model for the one-time forward-pass extraction...")
+        records = []
+        print(f"No existing {RESIDUALS_CACHE} found, starting fresh.")
+    except (EOFError, pickle.UnpicklingError) as e:
+        # Corrupted/truncated cache (e.g. from an interrupted write before
+        # the atomic-write fix above was in place). Can't be partially
+        # recovered -- treat as empty and re-extract everything.
+        print(f"WARNING: {RESIDUALS_CACHE} exists but is corrupted ({e}). "
+              f"Starting fresh -- all problems will be re-extracted.")
+        records = []
+
+    done_pids = {r["problem_id"] for r in records}
+    all_paths = sorted(glob.glob(f"{CHUNKED_DIR}/*.pt"))
+    remaining_paths = [
+        p for p in all_paths
+        if int(os.path.splitext(os.path.basename(p))[0]) not in done_pids
+    ]
+
+    if not remaining_paths:
+        print("All problems in chunked_captures/ are already cached -- nothing new to extract.")
+    else:
+        print(f"{len(remaining_paths)} new problems to extract "
+              f"({len(done_pids)} already cached, {len(all_paths)} total). Loading model...")
         tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
         model = AutoModelForCausalLM.from_pretrained(
             MODEL_NAME, torch_dtype=torch.bfloat16, device_map="auto"
         )
         model.eval()
-        print("Extracting all-layer residuals (one forward pass per chain)...")
-        records = extract_all_layers(model, tokenizer)
-        with open(RESIDUALS_CACHE, "wb") as f:
-            pickle.dump(records, f)
-        print(f"Saved -> {RESIDUALS_CACHE} ({len(records)} chains)")
+        records = extract_all_layers(model, tokenizer, remaining_paths, records)
+        print(f"Saved -> {RESIDUALS_CACHE} ({len(records)} total chains)")
 
     results = []
     for layer in CANDIDATE_LAYERS:
